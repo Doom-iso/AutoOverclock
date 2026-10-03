@@ -1,0 +1,33 @@
+import time
+import psutil, pynvml, subprocess
+pynvml.nvmlInit()                                  #apparently this imports all the necessary
+gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+#i like putting everything like this it is more tidy
+CpuUsage= psutil.cpu_percent(interval=1)
+GpuUsage= pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu
+GpuTemperature= pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+Clock = 3090    #easy to change gpu clock
+
+#if temperature or usage goes to high undervolt, the solution to everything
+def overclock ():
+    if CpuUsage >= 50:
+        ra = r"C:\ryzenadj\ryzenadj.exe"
+        subprocess.run([ra, f"--set-coall={0x100000 - 15}"])
+        print("CPU usage is high, undervolting CPU")
+    else:
+        ra = r"C:\ryzenadj\ryzenadj.exe"
+        subprocess.run([ra, "--set-coall=0"])
+        print("CPU usage is normal, resetting CPU voltage")
+    if GpuUsage >= 85 or GpuTemperature >= 60:
+        subprocess.run(["nvidia-smi", "-pl", "160"])
+        subprocess.run(["nvidia-smi", "-lgc", f"{Clock},3090"])
+        print("GPU usage is high, overclocking GPU")
+    else:
+        subprocess.run(["nvidia-smi", "-rgc"])
+        subprocess.run(["nvidia-smi", "-pl", "145"])
+        print("GPU usage is normal, resetting GPU clock")
+
+while True:
+    overclock()
+    time.sleep(60)   #this makes shure the script is continuous
