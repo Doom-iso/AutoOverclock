@@ -1,0 +1,72 @@
+import time
+import win32com.client
+import psutil, pynvml, subprocess
+pynvml.nvmlInit()                                  #apparently this imports all the necessary
+gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+
+def overclock ():
+#i like putting everything like this it is more tidy
+    CpuUsage= psutil.cpu_percent(interval=1)
+    GpuUsage= pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu
+    GpuTemperature= pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+    Clock = 3090    #easy to change gpu clock
+    radj = r"C:\ryzenadj\ryzenadj.exe"
+
+#if temperature or usage goes to high undervolt, the solution to everything
+    if CpuUsage >= 50 and CpuUsage <= 60:
+        subprocess.run(["ryzenadj", "--vcore=0.95", "--stapm-limit=55000"], check=False)
+        print("CPU usage is high, undervolting CPU")
+    elif CpuUsage >= 60 and CpuUsage < 70:
+        subprocess.run(["ryzenadj", "--vcore=0.925", "--stapm-limit=60000"], check=False)   
+        print ("light undervolt")
+    elif CpuUsage >= 70 and CpuUsage < 80:
+        subprocess.run(["ryzenadj", "--vcore=0.90", "--stapm-limit=65000"], check=False)
+        print("Slightly bigger undervolt")
+    elif CpuUsage >= 80 and CpuUsage < 90:
+        subprocess.run(["ryzenadj", "--vcore=0.875", "--stapm-limit=70000"], check=False)
+        print("nearly max undervolt")
+    elif CpuUsage >= 90:
+        subprocess.run(["ryzenadj", "--vcore=0.85", "--stapm-limit=75000"], check=False)     
+        print("Max UNdervolt")
+    else:
+        subprocess.run([radj, "--set-coall=0"])
+        print("CPU usage is normal, resetting CPU voltage")
+
+    if GpuTemperature >= 80:
+        subprocess.run(["nvidia-smi", "-rgc"])
+        subprocess.run(["nvidia-smi", "-pl", "145"])
+        print("GPU too hot, resetting GPU")
+
+    #Gpu overclock
+    if GpuUsage >= 65:
+        pynvml.nvmlDeviceSetPowerManagementLimit(gpu, 160 * 1000)
+        pynvml.nvmlDeviceSetGpuLockedClocks(gpu, Clock, 3090)
+        print("GPU usage is high, overclocking GPU")
+        pass
+    elif GpuUsage >= 70 and GpuUsage < 75:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 0); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 0)
+        print ("add slight undervolt")
+        pass
+    elif GpuUsage >= 75 and GpuUsage < 80:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 50); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 100)
+        print ("add small overclock and moderate undervolt")
+        pass
+    elif GpuUsage >= 80 and GpuUsage <= 85:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 200); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 400)
+        print ("add slightly bigger overclock and undervolt")
+        pass
+    elif GpuUsage >= 85 and GpuUsage <= 90:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 100); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 200)
+        print ("FINAL OVERCLOCK AND UNDERVOLT")
+        pass
+    elif GpuUsage >= 90:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 150); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 300)
+    else:
+        subprocess.run(["nvidia-smi", "-rgc"])
+        subprocess.run(["nvidia-smi", "-pl", "145"])
+        print("GPU usage is normal, resetting GPU clock")
+
+while True:
+    overclock()
+    time.sleep(60)   #this makes shure the script is continuous
