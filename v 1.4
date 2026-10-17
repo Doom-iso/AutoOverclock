@@ -1,0 +1,121 @@
+import time
+import win32com.client
+import psutil, pynvml, subprocess
+import clr
+clr.AddReference(r"C:\LibreHardwareMonitor\LibreHardwareMonitorLib.dll")
+from LibreHardwareMonitor.Hardware import Computer, SensorType
+pc = Computer()
+pc.IsMotherboardEnabled = True
+pc.Open()
+from LibreHardwareMonitor.Hardware import Computer, SensorType, HardwareType
+pc.IsCpuEnabled = True        # put this before pc.Open()
+cpu = next(h for h in pc.Hardware if h.HardwareType == HardwareType.Cpu)
+skip = ["Fan #1"]    # the name of the control your AIO pump is on (see step 4)
+pynvml.nvmlInit()                                  #apparently this imports all the necessary
+gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+
+def overclock ():
+#i like putting everything like this it is more tidy
+    temp = pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+    CpuUsage= psutil.cpu_percent(interval=1)
+    GpuUsage= pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu
+    GpuTemperature= pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+    radj = r"C:\ryzenadj\ryzenadj.exe"
+    cpu_temp = max(s.Value for s in cpu.Sensors if s.SensorType == SensorType.Temperature and s.Value is not None)
+    gpu_temp = pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+
+#if temperature or usage goes to high undervolt, the solution to everything
+    if CpuUsage >= 50 and CpuUsage <= 60:
+        subprocess.run(["ryzenadj", "--vcore=0.95", "--stapm-limit=55000"], check=False)
+        print("CPU usage is high, undervolting CPU")
+    elif CpuUsage >= 60 and CpuUsage < 70:
+        subprocess.run(["ryzenadj", "--vcore=0.925", "--stapm-limit=60000"], check=False)   
+        print ("light undervolt")
+    elif CpuUsage >= 70 and CpuUsage < 80:
+        subprocess.run(["ryzenadj", "--vcore=0.90", "--stapm-limit=65000"], check=False)
+        print("Slightly bigger undervolt")
+    elif CpuUsage >= 80 and CpuUsage < 90:
+        subprocess.run(["ryzenadj", "--vcore=0.875", "--stapm-limit=70000"], check=False)
+        print("nearly max undervolt")
+    elif CpuUsage >= 90:
+        subprocess.run(["ryzenadj", "--vcore=0.85", "--stapm-limit=75000"], check=False)     
+        print("Max UNdervolt")
+    else:
+        subprocess.run([radj, "--set-coall=0"])
+        print("CPU usage is normal, resetting CPU voltage")
+
+    if GpuTemperature >= 80:
+        subprocess.run(["nvidia-smi", "-rgc"])
+        subprocess.run(["nvidia-smi", "-pl", "145"])
+        print("GPU too hot, resetting GPU")
+
+    #Gpu overclock
+    if GpuUsage >= 65:
+        pynvml.nvmlDeviceSetPowerManagementLimit(gpu, 160 * 1000)
+        pynvml.nvmlDeviceSetGpuLockedClocks(gpu, 3090, 3090)
+        print("GPU usage is high, overclocking GPU")
+        pass
+    elif GpuUsage >= 70 and GpuUsage < 75:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 0); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 0)
+        print ("add slight undervolt")
+        pass
+    elif GpuUsage >= 75 and GpuUsage < 80:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 50); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 100)
+        print ("add small overclock and moderate undervolt")
+        pass
+    elif GpuUsage >= 80 and GpuUsage <= 85:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 200); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 400)
+        print ("add slightly bigger overclock and undervolt")
+        pass
+    elif GpuUsage >= 85 and GpuUsage <= 90:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 100); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 200)
+        print ("FINAL OVERCLOCK AND UNDERVOLT")
+        pass
+    elif GpuUsage >= 90:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 150); pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 300)
+    else:
+        subprocess.run(["nvidia-smi", "-rgc"])
+        subprocess.run(["nvidia-smi", "-pl", "145"])
+        print("GPU usage is normal, resetting GPU clock")
+
+def fan_speed() :
+    cpu_temp = max(s.Value for s in cpu.Sensors if s.SensorType == SensorType.Temperature and s.Value is not None)
+    gpu_temp = pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+    if gpu_temp >= 50 and gpu_temp < 60:
+        gpu_speed = 30
+        print("set gpu fan speed to 30")
+    elif gpu_temp >= 60 and gpu_temp < 70:
+        gpu_speed = 45
+        print("set gpu fan speed to 45")
+    elif gpu_temp >= 70 and gpu_temp < 80:
+        gpu_speed = 60
+        print("set gpu fan speed to 60")
+    elif gpu_temp >= 80 and gpu_temp < 90:
+        gpu_speed = 80
+        print("set gpu fan speed to 80")
+    else:
+        gpu_speed = 25
+        print("reset gpu fan speed")
+
+    if cpu_temp >= 50 and cpu_temp < 60:
+        cpu_speed = 30
+        print("set cpu fan speed to 30")
+    elif cpu_temp >= 60 and cpu_temp < 70:
+        cpu_speed = 45
+        print("set cpu fan speed to 45")
+    elif cpu_temp >= 70 and cpu_temp < 80:
+        cpu_speed = 60
+        print("set cpu fan speed to 60")
+    elif cpu_temp >= 80 and cpu_temp < 90:
+        cpu_speed = 80
+        print("set cpu fan speed to 80") 
+    else:
+        cpu_speed = 25
+        print("reset fan speed")
+
+
+while True:
+    overclock()
+    fan_speed()
+    time.sleep(30)   #this makes shure the script is continuous
