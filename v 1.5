@@ -1,0 +1,143 @@
+import subprocess
+import time
+
+import clr
+import psutil
+import pynvml
+
+clr.AddReference(r"C:\LibreHardwareMonitor\LibreHardwareMonitorLib.dll")
+from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType  # noqa: E402
+
+# ---------------------------------------------------------------- config ----
+RYZENADJ = r"C:\ryzenadj\ryzenadj.exe"
+LOOP_SECONDS = 30
+
+GPU_HOT_C = 80
+GPU_DEFAULT_POWER_W = 145
+GPU_BOOST_POWER_W = 160
+GPU_LOCKED_CLOCK_MHZ = 3090
+
+# (min usage %, vcore, stapm limit in mW, message), checked top to bottom
+CPU_TIERS = [
+    (90, "0.85",  75000, "Max undervolt"),
+    (80, "0.875", 70000, "Nearly max undervolt"),
+    (70, "0.90",  65000, "Slightly bigger undervolt"),
+    (60, "0.925", 60000, "Light undervolt"),
+    (50, "0.95",  55000, "CPU usage is high, undervolting"),
+]
+
+# (min usage %, core offset, mem offset, message), checked top to bottom.
+# The first matching tier wins.
+# NOTE: the first tier (>= 65) matches everything above it, so the offset
+# tiers below it can never run. To use them, move the 65 tier to the end.
+GPU_TIERS = [
+    (65, None, None, "Setting GPU max usage"),
+    (90, 150, 300, "Offset: +150 core / +300 mem"),
+    (85, 100, 200, "FINAL overclock and undervolt"),
+    (80, 200, 400, "Bigger overclock and undervolt"),
+    (75, 50, 100, "Small overclock, moderate undervolt"),
+    (70, 0, 0, "Slight undervolt"),
+]
+
+# (min temp C, fan %), checked top to bottom; below the last tier -> FAN_IDLE
+FAN_TIERS = [(80, 80), (70, 60), (60, 45), (50, 30)]
+FAN_IDLE = 25
+
+# ----------------------------------------------------------------- setup ----
+pc = Computer()
+pc.IsMotherboardEnabled = True
+pc.IsCpuEnabled = True
+pc.Open()
+cpu = next(h for h in pc.Hardware if h.HardwareType == HardwareType.Cpu)
+
+pynvml.nvmlInit()
+gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+
+# --------------------------------------------------------------- helpers ----
+def read_cpu_temp():
+    cpu.Update()  # without this LibreHardwareMonitor returns stale values
+    return max(
+        (s.Value for s in cpu.Sensors
+         if s.SensorType == SensorType.Temperature and s.Value is not None),
+        default=0,
+    )
+
+
+def read_gpu_temp():
+    return pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+
+
+def pick(tiers, value):
+    """Return the first tier whose threshold the value meets, else None."""
+    return next((t for t in tiers if value >= t[0]), None)
+
+
+def reset_gpu():
+    pynvml.nvmlDeviceResetGpuLockedClocks(gpu)
+    pynvml.nvmlDeviceSetPowerManagementLimit(gpu, GPU_DEFAULT_POWER_W * 1000)
+
+
+# ------------------------------------------------------------------ CPU -----
+def tune_cpu():
+    usage = psutil.cpu_percent(interval=1)
+    tier = pick(CPU_TIERS, usage)
+    if tier:
+        _, vcore, stapm, msg = tier
+        subprocess.run([RYZENADJ, f"--vcore={vcore}", f"--stapm-limit={stapm}"], check=False)
+        print(msg)
+    else:
+        subprocess.run([RYZENADJ, "--set-coall=0"], check=False)
+        print("CPU usage is normal, resetting CPU voltage")
+
+
+# ------------------------------------------------------------------ GPU -----
+def tune_gpu():
+    if read_gpu_temp() >= GPU_HOT_C:
+        reset_gpu()
+        print("GPU too hot, resetting GPU")
+
+    usage = pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu
+    tier = pick(GPU_TIERS, usage)
+    if tier is None:
+        reset_gpu()
+        print("GPU usage is normal, resetting GPU clock")
+        return
+
+    _, core, mem, msg = tier
+    if core is None:  # the "max usage" tier: power limit + locked clocks
+        pynvml.nvmlDeviceSetPowerManagementLimit(gpu, GPU_BOOST_POWER_W * 1000)
+        pynvml.nvmlDeviceSetGpuLockedClocks(gpu, GPU_LOCKED_CLOCK_MHZ, GPU_LOCKED_CLOCK_MHZ)
+    else:
+        pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, core)
+        pynvml.nvmlDeviceSetMemClkVfOffset(gpu, mem)
+    print(msg)
+
+
+# ------------------------------------------------------------------ fans ----
+def fan_speed_for(temp):
+    tier = pick(FAN_TIERS, temp)
+    return tier[1] if tier else FAN_IDLE
+
+
+def update_fans():
+    cpu_speed = fan_speed_for(read_cpu_temp())
+    gpu_speed = fan_speed_for(read_gpu_temp())
+    # TODO: this only computes the speeds, nothing applies them to the fans yet
+    print(f"fans -> cpu {cpu_speed}%, gpu {gpu_speed}%")
+
+
+# ------------------------------------------------------------------ main ----
+def main():
+    while True:
+        try:
+            tune_cpu()
+            tune_gpu()
+            update_fans()
+        except (pynvml.NVMLError, OSError) as e:
+            print("Command refused:", e)
+        time.sleep(LOOP_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
