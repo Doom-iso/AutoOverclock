@@ -1,0 +1,211 @@
+import subprocess
+import time
+
+import clr
+import psutil
+import pynvml
+
+clr.AddReference(r"C:\LibreHardwareMonitor\LibreHardwareMonitorLib.dll")
+from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType  # noqa: E402
+
+# ---------------------------------------------------------------- config ----
+RYZENADJ = r"C:\ryzenadj\ryzenadj.exe"
+LOOP_SECONDS = 30
+
+# GPU (RTX 5060: default 145 W, allowed 123-160 W, max clock 3090 MHz)
+GPU_DEFAULT_POWER_W = 145
+GPU_BOOST_POWER_W = 160
+GPU_LOCKED_CLOCK_MHZ = 3090
+GPU_ACTIVE_USAGE = 65          # below this the GPU is left at stock
+GPU_HOT_C = 80                 # trip point for the thermal guard
+GPU_COOLDOWN_C = 75            # guard releases once the GPU is below this
+
+# (min CPU usage %, vcore, stapm limit in mW, message), checked top to bottom
+CPU_TIERS = [
+    (90, "0.85",  75000, "Max undervolt"),
+    (80, "0.875", 70000, "Nearly max undervolt"),
+    (70, "0.90",  65000, "Slightly bigger undervolt"),
+    (60, "0.925", 60000, "Light undervolt"),
+    (50, "0.95",  55000, "CPU usage is high, undervolting"),
+]
+
+# (min GPU usage %, core offset MHz, mem offset MHz, message), top to bottom.
+# Anything at or above GPU_ACTIVE_USAGE but below the last tier gets 0 / 0.
+# Clocks stay locked at GPU_LOCKED_CLOCK_MHZ, so a positive offset acts as
+# an undervolt at that frequency.
+GPU_TIERS = [
+    (90, 150, 300, "Offset +150 core / +300 mem"),
+    (85, 100, 200, "FINAL overclock and undervolt"),
+    (80, 200, 400, "Bigger overclock and undervolt"),
+    (75, 50, 100, "Small overclock, moderate undervolt"),
+    (70, 0, 0, "Slight undervolt"),
+]
+
+# (min temp C, fan %), top to bottom; below the last tier -> FAN_IDLE
+FAN_TIERS = [(80, 80), (70, 60), (60, 45), (50, 30)]
+FAN_IDLE = 25
+SKIP_FANS = ["Fan #1"]         # motherboard fan controls to leave alone (AIO pump)
+
+# ----------------------------------------------------------------- setup ----
+pc = Computer()
+pc.IsMotherboardEnabled = True
+pc.IsCpuEnabled = True
+pc.Open()
+cpu = next(h for h in pc.Hardware if h.HardwareType == HardwareType.Cpu)
+board = next(h for h in pc.Hardware if h.HardwareType == HardwareType.Motherboard)
+
+pynvml.nvmlInit()
+gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+gpu_too_hot = False            # thermal guard state
+gpu_fan_warned = False         # only warn once if GPU fan control is unsupported
+
+
+# --------------------------------------------------------------- helpers ----
+def read_cpu_temp():
+    cpu.Update()  # without this LibreHardwareMonitor returns stale values
+    return max(
+        (s.Value for s in cpu.Sensors
+         if s.SensorType == SensorType.Temperature and s.Value is not None),
+        default=0,
+    )
+
+
+def read_gpu_temp():
+    return pynvml.nvmlDeviceGetTemperature(gpu, pynvml.NVML_TEMPERATURE_GPU)
+
+
+def pick(tiers, value):
+    """Return the first tier whose threshold the value meets, else None."""
+    return next((t for t in tiers if value >= t[0]), None)
+
+
+def reset_gpu():
+    pynvml.nvmlDeviceResetGpuLockedClocks(gpu)
+    pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, 0)
+    pynvml.nvmlDeviceSetMemClkVfOffset(gpu, 0)
+    pynvml.nvmlDeviceSetPowerManagementLimit(gpu, GPU_DEFAULT_POWER_W * 1000)
+
+
+def find_fan_controls():
+    """Motherboard fan controls, minus anything listed in SKIP_FANS."""
+    controls = []
+    for sub in board.SubHardware:
+        sub.Update()
+        for s in sub.Sensors:
+            if s.SensorType == SensorType.Control and s.Control is not None \
+                    and s.Name not in SKIP_FANS:
+                controls.append(s)
+    return controls
+
+
+fan_controls = find_fan_controls()
+print("Controlling fans:", [s.Name for s in fan_controls] or "none found")
+print("Skipping fans:", SKIP_FANS)
+
+
+# ------------------------------------------------------------------ CPU -----
+def tune_cpu():
+    usage = psutil.cpu_percent(interval=1)
+    tier = pick(CPU_TIERS, usage)
+    if tier:
+        _, vcore, stapm, msg = tier
+        subprocess.run([RYZENADJ, f"--vcore={vcore}", f"--stapm-limit={stapm}"], check=False)
+        print(msg)
+    else:
+        subprocess.run([RYZENADJ, "--set-coall=0"], check=False)
+        print("CPU usage is normal, resetting CPU voltage")
+
+
+# ------------------------------------------------------------------ GPU -----
+def tune_gpu():
+    global gpu_too_hot
+
+    temp = read_gpu_temp()
+    if temp >= GPU_HOT_C:
+        gpu_too_hot = True
+    elif temp < GPU_COOLDOWN_C:
+        gpu_too_hot = False
+
+    if gpu_too_hot:  # stay at stock until it has actually cooled down
+        reset_gpu()
+        print(f"GPU too hot ({temp}C), staying at stock")
+        return
+
+    usage = pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu
+    if usage < GPU_ACTIVE_USAGE:
+        reset_gpu()
+        print("GPU usage is normal, resetting GPU clock")
+        return
+
+    tier = pick(GPU_TIERS, usage)
+    _, core, mem, msg = tier if tier else (0, 0, 0, "Max usage, no offset")
+
+    pynvml.nvmlDeviceSetPowerManagementLimit(gpu, GPU_BOOST_POWER_W * 1000)
+    pynvml.nvmlDeviceSetGpuLockedClocks(gpu, GPU_LOCKED_CLOCK_MHZ, GPU_LOCKED_CLOCK_MHZ)
+    pynvml.nvmlDeviceSetGpcClkVfOffset(gpu, core)
+    pynvml.nvmlDeviceSetMemClkVfOffset(gpu, mem)
+    print(msg)
+
+
+# ------------------------------------------------------------------ fans ----
+def fan_speed_for(temp):
+    tier = pick(FAN_TIERS, temp)
+    return tier[1] if tier else FAN_IDLE
+
+
+def set_gpu_fans(speed):
+    global gpu_fan_warned
+    try:
+        for i in range(pynvml.nvmlDeviceGetNumFans(gpu)):
+            pynvml.nvmlDeviceSetFanSpeed_v2(gpu, i, speed)
+    except pynvml.NVMLError as e:
+        if not gpu_fan_warned:
+            print("GPU fan control not available, leaving GPU fans on auto:", e)
+            gpu_fan_warned = True
+
+
+def update_fans():
+    cpu_speed = fan_speed_for(read_cpu_temp())
+    gpu_speed = fan_speed_for(read_gpu_temp())
+    case_speed = max(cpu_speed, gpu_speed)   # case/radiator fans follow the hotter part
+
+    for s in fan_controls:
+        s.Control.SetSoftware(float(case_speed))
+    set_gpu_fans(gpu_speed)
+    print(f"fans -> case {case_speed}%, gpu {gpu_speed}%")
+
+
+def release_fans():
+    """Hand fan control back to the BIOS / GPU firmware."""
+    for s in fan_controls:
+        s.Control.SetDefault()
+    try:
+        for i in range(pynvml.nvmlDeviceGetNumFans(gpu)):
+            pynvml.nvmlDeviceSetDefaultFanSpeed_v2(gpu, i)
+    except pynvml.NVMLError:
+        pass
+
+
+# ------------------------------------------------------------------ main ----
+def main():
+    try:
+        while True:
+            # each task is isolated so one failure doesn't skip the others
+            for task in (tune_cpu, tune_gpu, update_fans):
+                try:
+                    task()
+                except (pynvml.NVMLError, OSError) as e:
+                    print(f"{task.__name__} failed:", e)
+            time.sleep(LOOP_SECONDS)
+    finally:
+        # on exit or crash, don't leave fans pinned or the GPU locked
+        release_fans()
+        try:
+            reset_gpu()
+        except pynvml.NVMLError:
+            pass
+
+
+if __name__ == "__main__":
+    main()
